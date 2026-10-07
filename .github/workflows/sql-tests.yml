@@ -1,0 +1,194 @@
+name: sql-tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      commits:
+        description: JSON array of full commit SHAs to test
+        required: true
+        default: '["4aacc83be52be119fb10e7eb5164cfb8feb13774"]'
+      ngroups:
+        description: SQL test groups per commit
+        required: true
+        default: "1"
+
+env:
+  APT_DEPS: >-
+    build-essential cmake ninja-build protobuf-compiler libprotobuf-dev
+    libssl-dev pkg-config libncurses-dev libnuma-dev libtirpc-dev bison flex
+    libjemalloc2 wget
+  BASE_TAG: v1
+  # Part of the cache version: save and restore must pass the same list.
+  BASE_PATHS: |
+    boost/boost_1_77_0
+    third_party/mysql-server
+    third_party/duckdb
+    build
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      key: ${{ steps.key.outputs.key }}
+      mysql: ${{ steps.key.outputs.mysql }}
+      duckdb: ${{ steps.key.outputs.duckdb }}
+      groups: ${{ steps.key.outputs.groups }}
+      hit: ${{ steps.lookup.outputs.cache-hit }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: key
+        env:
+          NGROUPS: ${{ inputs.ngroups }}
+        run: |
+          git ls-tree HEAD third_party/mysql-server third_party/duckdb
+          mysql=$(git rev-parse HEAD:third_party/mysql-server)
+          duckdb=$(git rev-parse HEAD:third_party/duckdb)
+          {
+            echo "mysql=$mysql"
+            echo "duckdb=$duckdb"
+            echo "key=helios-base-$BASE_TAG-$mysql-$duckdb"
+            echo "groups=$(seq 0 $((NGROUPS - 1)) | jq -cs .)"
+          } | tee -a "$GITHUB_OUTPUT"
+      - id: lookup
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.BASE_PATHS }}
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+
+  base:
+    needs: plan
+    if: needs.plan.outputs.hit != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Runner info
+        run: echo "$ImageOS $ImageVersion"; nproc; free -g; df -h
+      - uses: actions/checkout@v4
+      - parallel:
+          - name: Free disk
+            run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          - name: Install apt packages
+            run: sudo apt-get update && sudo apt-get install -y $APT_DEPS
+          - name: Fetch submodules
+            run: git submodule update --init --depth 1 third_party/mysql-server third_party/duckdb server/storage/third_party/*
+          - name: Fetch Boost
+            # build.sh extracts only when it downloads, so extract here too.
+            run: |
+              mkdir -p boost && cd boost
+              wget -q --tries=5 https://archives.boost.io/release/1.77.0/source/boost_1_77_0.tar.bz2
+              tar xfj boost_1_77_0.tar.bz2
+      - name: Toolchain
+        run: df -h; cmake --version; gcc --version; ninja --version
+      - name: Build (scripts/build.sh)
+        run: time ./scripts/build.sh
+      - name: Check build outputs
+        # build.sh has no set -e, so check what it should have produced.
+        run: |
+          ls -l build/runtime_output_directory/mysqld \
+            build/plugin_output_directory/ha_helios_storage_engine.so \
+            third_party/duckdb/build/release/src/libduckdb.so \
+            build/server/helios-storage
+          ninja -C build -n | head -5 || true
+      - name: Trim cache tree
+        # build/server uses -march=native, so each test VM compiles it. The
+        # submodule .git files would point at module dirs a test job lacks.
+        run: |
+          rm -rf build/server build/data*
+          rm -f third_party/mysql-server/.git third_party/duckdb/.git
+          du -sh $BASE_PATHS
+          df -h
+      - uses: actions/cache/save@v4
+        with:
+          path: ${{ env.BASE_PATHS }}
+          key: ${{ needs.plan.outputs.key }}
+
+  sql:
+    needs: [plan, base]
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    name: sql ${{ matrix.commit }} g${{ matrix.group }}
+    strategy:
+      fail-fast: false
+      matrix:
+        commit: ${{ fromJSON(inputs.commits) }}
+        group: ${{ fromJSON(needs.plan.outputs.groups) }}
+    steps:
+      - name: Runner info
+        run: echo "$ImageOS $ImageVersion"; nproc; free -g; df -h
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.commit }}
+          fetch-depth: 0
+      - name: Check gitlinks against the base
+        run: |
+          for pair in mysql-server=${{ needs.plan.outputs.mysql }} duckdb=${{ needs.plan.outputs.duckdb }}; do
+            got=$(git rev-parse "HEAD:third_party/${pair%%=*}")
+            if [ "$got" != "${pair#*=}" ]; then
+              echo "::error::third_party/${pair%%=*} is $got but the base cache has ${pair#*=}"
+              exit 1
+            fi
+          done
+      - parallel:
+          - name: Restore base cache
+            uses: actions/cache/restore@v4
+            with:
+              path: ${{ env.BASE_PATHS }}
+              key: ${{ needs.plan.outputs.key }}
+              fail-on-cache-miss: true
+          - name: Install apt packages
+            run: sudo apt-get update && sudo apt-get install -y $APT_DEPS
+          - name: Fetch storage submodules
+            run: git submodule update --init --depth 1 server/storage/third_party/*
+          - name: Install pip packages
+            run: python3 -m pip install --user --break-system-packages -r test/pytest/requirements.txt
+      - name: Set aside the runner's MySQL config
+        # mysqld reads /etc/mysql/my.cnf; a dev box has none.
+        run: |
+          ls -la /etc/mysql /etc/my.cnf ~/.my.cnf 2>&1 || true
+          if [ -d /etc/mysql ]; then sudo mv /etc/mysql /etc/mysql.ci-off; fi
+          rm -f ~/.my.cnf
+      - name: Configure server
+        run: cmake -S server -B build/server -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=1
+      - name: Run SQL tests
+        run: |
+          export USER="${USER:-$(id -un)}"
+          git show "$GITHUB_SHA:ci/timed_run.py" > "$RUNNER_TEMP/timed_run.py"
+          python3 "$RUNNER_TEMP/timed_run.py" ${{ matrix.group }} ${{ inputs.ngroups }} "$RUNNER_TEMP/out"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-${{ matrix.commit }}-g${{ matrix.group }}
+          path: ${{ runner.temp }}/out/timing.json
+          retention-days: 3
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.commit }}-g${{ matrix.group }}
+          path: |
+            ${{ runner.temp }}/out/logs
+            helios_data/logs
+          retention-days: 3
+
+  gtest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    name: gtest ${{ matrix.commit }}
+    strategy:
+      fail-fast: false
+      matrix:
+        commit: ${{ fromJSON(inputs.commits) }}
+    steps:
+      - name: Runner info
+        run: echo "$ImageOS $ImageVersion"; nproc; free -g; df -h
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.commit }}
+      - parallel:
+          - name: Install apt packages
+            run: sudo apt-get update && sudo apt-get install -y $APT_DEPS
+          - name: Fetch storage submodules
+            run: git submodule update --init --depth 1 server/storage/third_party/*
+      - name: Storage tests
+        run: time ./scripts/storage_tests.sh "$RUNNER_TEMP/storage-build"
