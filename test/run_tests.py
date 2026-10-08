@@ -3,6 +3,8 @@ import sys
 import glob
 import argparse
 import shutil
+import socket
+import subprocess
 import time
 
 SERVER_HOST = "127.0.0.1"
@@ -12,10 +14,28 @@ SERVER_PORT = "9999"
 
 QUIET = "> /dev/null 2>&1"
 
+def wait_until(ready, what, timeout):
+  deadline = time.monotonic() + timeout
+  while not ready():
+    if time.monotonic() > deadline:
+      print(f"Warning: {what} after {timeout} s")
+      return
+    time.sleep(0.05)
+
+def gone(pattern):
+  return subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.DEVNULL).returncode != 0
+
+def listening(port):
+  with socket.socket() as probe:
+    return probe.connect_ex((SERVER_HOST, int(port))) == 0
+
 def restart_services():
   """Restart the storage server and MySQL for a clean state."""
   os.system(f"./scripts/stop_mysql.sh {QUIET}")
   os.system(f"./scripts/stop_server.sh {QUIET}")
+  # The stop scripts send SIGKILL and return before the processes exit.
+  for pattern in ("runtime_output_directory/mysqld", "build/server/helios-storage"):
+    wait_until(lambda: gone(pattern), f"{pattern} still runs", 10)
   # An interrupted run can leave a contract behind in the local overrides.
   if os.path.exists("helios.local.cnf"):
     os.unlink("helios.local.cnf")
@@ -24,9 +44,8 @@ def restart_services():
   # The work directory may be a link onto another volume: clear it, keep it.
   for entry in (os.scandir("helios_data") if os.path.isdir("helios_data") else []):
     shutil.rmtree(entry.path, ignore_errors=True) if entry.is_dir(follow_symlinks=False) else os.unlink(entry.path)
-  time.sleep(1)
   os.system(f"./scripts/start_server.sh {QUIET}")
-  time.sleep(2)
+  wait_until(lambda: listening(SERVER_PORT), f"nothing listens on {SERVER_PORT}", 30)
   os.system(f"./scripts/start_mysql.sh --mysqld-port {MYSQLD_PORT} --server-host {SERVER_HOST} --server-port {SERVER_PORT} {QUIET}")
 
 def run_tests(test_files):

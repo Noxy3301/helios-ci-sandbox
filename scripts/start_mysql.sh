@@ -63,6 +63,12 @@ if [ ! -d "$DATA_DIR" ] || [ ! -f "$DATA_DIR/ibdata1" ]; then
   ./runtime_output_directory/mysqld --initialize-insecure --user="$USER" --datadir="$DATA_DIR"
 fi
 
+# INSTALL PLUGIN and CREATE USER persist in the datadir, so steps 2-5 run once.
+# The marker is written only after the TCP check at the end succeeds.
+PROVISIONED="$DATA_DIR/.helios_provisioned"
+if [ -f "$PROVISIONED" ]; then
+  echo "Steps 2-5 skipped: $DATA_DIR is already provisioned"
+else
 echo "Step 2/5: Starting MySQL with InnoDB..."
 ./runtime_output_directory/mysqld --datadir="$DATA_DIR" --socket="$SOCKET" --port="$MYSQLD_PORT" \
   --pid-file="$PID_FILE" \
@@ -76,7 +82,7 @@ BOOT_PID=$!
 
 echo "Step 3/5: Waiting for MySQL to be ready..."
 until ./runtime_output_directory/mysqladmin ping -u root --socket="$SOCKET" --port="$MYSQLD_PORT" >/dev/null 2>&1; do
-  sleep 1
+  sleep 0.1
 done
 
 echo "Step 4/5: Installing Helios plugin..."
@@ -98,6 +104,7 @@ echo "Step 5/5: Stopping MySQL and restarting with Helios as default..."
 kill "$BOOT_PID" 2>/dev/null || true
 wait "$BOOT_PID" 2>/dev/null || true
 sleep 3
+fi
 
 nohup ./runtime_output_directory/mysqld --datadir="$DATA_DIR" --socket="$SOCKET" --port="$MYSQLD_PORT" \
   --pid-file="$PID_FILE" --default-storage-engine=helios \
@@ -111,7 +118,7 @@ MYSQL_PID=$!
 disown "$MYSQL_PID" 2>/dev/null || true
 
 until ./runtime_output_directory/mysqladmin ping -u root --socket="$SOCKET" --port="$MYSQLD_PORT" >/dev/null 2>&1; do
-  sleep 1
+  sleep 0.1
 done
 
 ./runtime_output_directory/mysql -u root --socket="$SOCKET" --port="$MYSQLD_PORT" \
@@ -121,6 +128,7 @@ done
 # runs on the socket and would report success even if provisioning failed.
 ./runtime_output_directory/mysql -u root --protocol=TCP --host=127.0.0.1 --port="$MYSQLD_PORT" \
   -e "SELECT 1;" >/dev/null
+touch "$PROVISIONED"
 
 echo "MySQL running with Helios"
 echo "PID       : $MYSQL_PID"
