@@ -30,23 +30,29 @@ def listening(port):
     return probe.connect_ex((SERVER_HOST, int(port))) == 0
 
 def restart_services():
-  """Restart the storage server and MySQL for a clean state."""
-  os.system(f"./scripts/stop_mysql.sh {QUIET}")
+  """Restart the storage server, and MySQL only when it does not answer."""
   os.system(f"./scripts/stop_server.sh {QUIET}")
   # The stop scripts send SIGKILL and return before the processes exit.
-  for pattern in ("runtime_output_directory/mysqld", "build/server/helios-storage"):
-    wait_until(lambda: gone(pattern), f"{pattern} still runs", 10)
+  wait_until(lambda: gone("build/server/helios-storage"), "helios-storage still runs", 10)
   # An interrupted run can leave a contract behind in the local overrides.
   if os.path.exists("helios.local.cnf"):
     os.unlink("helios.local.cnf")
   # The storage restores its PAX catalog and rows at startup, and the suite
-  # re-creates tables with different columns.
+  # re-creates tables with different columns. A running mysqld still writes
+  # its log under logs/, so that directory stays.
   # The work directory may be a link onto another volume: clear it, keep it.
   for entry in (os.scandir("helios_data") if os.path.isdir("helios_data") else []):
+    if entry.name == "logs":
+      continue
     shutil.rmtree(entry.path, ignore_errors=True) if entry.is_dir(follow_symlinks=False) else os.unlink(entry.path)
   os.system(f"./scripts/start_server.sh {QUIET}")
   wait_until(lambda: listening(SERVER_PORT), f"nothing listens on {SERVER_PORT}", 30)
-  os.system(f"./scripts/start_mysql.sh --mysqld-port {MYSQLD_PORT} --server-host {SERVER_HOST} --server-port {SERVER_PORT} {QUIET}")
+  # Files switch the GLOBAL read path; a failure here means mysqld is gone.
+  if os.system(f"build/runtime_output_directory/mysql -u root --protocol=TCP --host={SERVER_HOST} "
+               f"--port={MYSQLD_PORT} -e 'SET GLOBAL helios_read_path=DEFAULT' {QUIET}") != 0:
+    os.system(f"./scripts/stop_mysql.sh {QUIET}")
+    wait_until(lambda: gone("runtime_output_directory/mysqld"), "mysqld still runs", 10)
+    os.system(f"./scripts/start_mysql.sh --mysqld-port {MYSQLD_PORT} --server-host {SERVER_HOST} --server-port {SERVER_PORT} {QUIET}")
 
 def run_tests(test_files):
   os.system(f"./scripts/build_partial.sh {QUIET}")
